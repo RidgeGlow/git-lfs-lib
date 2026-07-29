@@ -36,6 +36,8 @@ jobs:
       env:
           FORCE_LOCALIZE: true
     - run: mkdir -p bin/assets
+    - run: CGO_ENABLED=1 go build -buildmode=c-archive -tags libgitlfs -o bin/assets/gitlfs-${{ matrix.os }}.a .
+      if: ${{ matrix.os == 'macos-latest' || matrix.os == 'ubuntu-latest' }}
     - run: find bin/releases -name "*$(uname -s | tr A-Z a-z)*" | xargs -I{} cp {} bin/assets
     - uses: actions/upload-artifact@v7
       with:
@@ -108,6 +110,8 @@ jobs:
     - run: mv bin\git-lfs.exe git-lfs-arm64.exe
     - run: iscc script\windows-installer\inno-setup-git-lfs-installer.iss
     - run: mkdir -p bin/assets
+      shell: bash
+    - run: CGO_ENABLED=1 GOPATH="$HOME/go" PATH="$HOME/go/bin:$PATH" go build -buildmode=c-archive -tags libgitlfs -o bin/assets/gitlfs-windows-latest.a .
       shell: bash
     - run: mv *.exe bin/assets
       shell: bash

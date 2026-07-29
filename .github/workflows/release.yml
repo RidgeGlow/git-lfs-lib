@@ -96,6 +96,8 @@ jobs:
       shell: bash
     - run: make release-windows-rebuild
       shell: bash
+    - run: CGO_ENABLED=1 GOPATH="$HOME/go" PATH="$HOME/go/bin:$PATH" go build -buildmode=c-archive -tags libgitlfs -o bin/releases/gitlfs-windows-amd64.a .
+      shell: bash
     - uses: actions/upload-artifact@v7
       with:
         name: windows-assets
@@ -131,6 +133,7 @@ jobs:
         DARWIN_DEV_USER: ${{secrets.MACOS_DEV_USER}}
         DARWIN_DEV_PASS: ${{secrets.MACOS_DEV_PASS}}
         DARWIN_DEV_TEAM: ${{secrets.MACOS_DEV_TEAM}}
+    - run: CGO_ENABLED=1 go build -buildmode=c-archive -tags libgitlfs -o bin/releases/gitlfs-darwin-amd64.a .
     - uses: actions/upload-artifact@v7
       with:
         name: macos-assets
