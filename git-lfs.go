@@ -1,3 +1,5 @@
+//go:build !libgitlfs
+
 package main
 
 import (
