@@ -57,18 +57,23 @@ jobs:
       shell: bash
       run: |
         set -eu
-        cd dist
-        archive="$(ls *.a *.lib 2>/dev/null | head -n1)"
+        # find, not a glob: `ls *.a *.lib` reports failure for whichever
+        # pattern does not match on this platform, and pipefail turns that
+        # into a step failure even though the archive was found.
+        archive="$(find dist -maxdepth 1 \( -name '*.a' -o -name '*.lib' \) | head -n1)"
+        [ -n "$archive" ] || { echo "::error::no archive was produced"; exit 1; }
         # A c-archive must be a real ar archive...
-        head -c 8 "$archive" | grep -q '^!<arch>' \
-          || { echo "::error::$archive is not an ar archive"; exit 1; }
+        case "$(head -c 8 "$archive")" in
+          '!<arch>'*) ;;
+          *) echo "::error::$archive is not an ar archive"; exit 1 ;;
+        esac
         # ...and must actually export the entry points.
         for sym in GitLFS_Lock GitLFS_Unlock GitLFS_Locks \
                    GitLFS_FreeLocks GitLFS_FreeError; do
-          grep -q "$sym" "$archive" \
+          grep -qa "$sym" "$archive" \
             || { echo "::error::$archive is missing symbol $sym"; exit 1; }
         done
-        echo "$archive: ar archive with all exported symbols present"
+        echo "$archive: ar archive, all exported symbols present"
 
     - uses: actions/upload-artifact@v7
       with:
