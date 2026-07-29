@@ -112,7 +112,7 @@ jobs:
     - run: iscc script\windows-installer\inno-setup-git-lfs-installer.iss
     - run: mkdir -p bin/assets
       shell: bash
-    - run: CGO_ENABLED=1 GOPATH="$HOME/go" PATH="$HOME/go/bin:$PATH" go build -buildmode=c-archive -tags libgitlfs -o bin/assets/gitlfs-windows-latest.a .
+    - run: CGO_ENABLED=1 GOPATH="$HOME/go" PATH="$HOME/go/bin:$PATH" go build -buildmode=c-archive -tags libgitlfs -o bin/assets/gitlfs-windows-latest.lib .
       shell: bash
     - run: cp libgitlfs.h bin/assets/
       shell: bash

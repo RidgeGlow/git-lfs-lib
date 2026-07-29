@@ -96,7 +96,7 @@ jobs:
       shell: bash
     - run: make release-windows-rebuild
       shell: bash
-    - run: CGO_ENABLED=1 GOPATH="$HOME/go" PATH="$HOME/go/bin:$PATH" go build -buildmode=c-archive -tags libgitlfs -o bin/releases/gitlfs-windows-amd64.a .
+    - run: CGO_ENABLED=1 GOPATH="$HOME/go" PATH="$HOME/go/bin:$PATH" go build -buildmode=c-archive -tags libgitlfs -o bin/releases/gitlfs-windows-amd64.lib .
       shell: bash
     - run: cp libgitlfs.h bin/releases/
       shell: bash
