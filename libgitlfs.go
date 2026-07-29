@@ -6,17 +6,7 @@ package main
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct {
-    char* Id;
-    char* Path;
-    char* LockedAt;
-    char* OwnerName;
-} GitLFSLock;
-
-typedef struct {
-    GitLFSLock* Locks;
-    int Count;
-} GitLFSLockList;
+#include "libgitlfs.h"
 */
 import "C"
 
