@@ -1,0 +1,82 @@
+name: Library
+
+# Builds libgitlfs as a C-compatible static archive for each supported platform.
+#
+# This workflow is intentionally self-contained and additive: it does not modify
+# or depend on ci.yml or release.yml, so those files can be fast-forwarded from
+# upstream without conflicts. See libgitlfs/README.md.
+on: [push, pull_request]
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  build:
+    name: Build library (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Each platform is independent; a failure on one must not cancel the
+      # others, otherwise a single break hides the state of every other target.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - uses: actions/setup-go@v6
+      with:
+        go-version: '1.26.x'
+
+    # cgo needs a gcc-compatible toolchain. The Git for Windows SDK provides
+    # MinGW; MSVC cannot drive cgo.
+    - uses: git-for-windows/setup-git-for-windows-sdk@v2
+      if: runner.os == 'Windows'
+
+    - name: Build static archive
+      shell: bash
+      run: |
+        set -eu
+        # Derive the label from the toolchain rather than from the runner
+        # label, so an artifact can never claim an architecture it isn't.
+        GOOS="$(go env GOOS)"
+        GOARCH="$(go env GOARCH)"
+        case "$GOOS" in
+          windows) EXT=lib ;;
+          *)       EXT=a   ;;
+        esac
+        NAME="libgitlfs-${GOOS}-${GOARCH}"
+        mkdir -p dist
+        CGO_ENABLED=1 go build -buildmode=c-archive -tags libgitlfs \
+          -o "dist/${NAME}.${EXT}" ./libgitlfs
+        cp libgitlfs/libgitlfs.h dist/
+        ls -l dist
+
+    - name: Verify archive
+      shell: bash
+      run: |
+        set -eu
+        # find, not a glob: `ls *.a *.lib` reports failure for whichever
+        # pattern does not match on this platform, and pipefail turns that
+        # into a step failure even though the archive was found.
+        archive="$(find dist -maxdepth 1 \( -name '*.a' -o -name '*.lib' \) | head -n1)"
+        [ -n "$archive" ] || { echo "::error::no archive was produced"; exit 1; }
+        # A c-archive must be a real ar archive...
+        case "$(head -c 8 "$archive")" in
+          '!<arch>'*) ;;
+          *) echo "::error::$archive is not an ar archive"; exit 1 ;;
+        esac
+        # ...and must actually export the entry points.
+        for sym in GitLFS_Lock GitLFS_Unlock GitLFS_Locks \
+                   GitLFS_LockMany GitLFS_UnlockMany \
+                   GitLFS_FreeLocks GitLFS_FreePathResults GitLFS_FreeError; do
+          grep -qa "$sym" "$archive" \
+            || { echo "::error::$archive is missing symbol $sym"; exit 1; }
+        done
+        echo "$archive: ar archive, all exported symbols present"
+
+    - uses: actions/upload-artifact@v7
+      with:
+        name: libgitlfs-${{ matrix.os }}
+        path: dist
