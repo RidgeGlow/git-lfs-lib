@@ -12,6 +12,7 @@ import "C"
 
 import (
 	"path/filepath"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -26,19 +27,52 @@ func main() {
 	// Empty main function is required for buildmode=c-archive
 }
 
-func setupLockClient(rPath string, errorMsg **C.char) (*config.Configuration, *locking.Client, error) {
+// session bundles everything one call needs, so that a bulk operation pays the
+// setup cost once rather than once per path.
+type session struct {
+	cfg        *config.Configuration
+	apiClient  *lfsapi.Client
+	lockClient *locking.Client
+}
+
+func (s *session) Close() {
+	if s.lockClient != nil {
+		s.lockClient.Close()
+	}
+}
+
+// setErr stores msg into *errorMsg when the caller asked for it. Callers of
+// this API are not required to pre-initialise errorMsg, so every entry point
+// clears it first; otherwise a caller checking errorMsg after a successful
+// call would read whatever was already on their stack.
+func setErr(errorMsg **C.char, msg string) {
+	if errorMsg != nil {
+		*errorMsg = C.CString(msg)
+	}
+}
+
+func clearErr(errorMsg **C.char) {
+	if errorMsg != nil {
+		*errorMsg = nil
+	}
+}
+
+func newSession(rPath string, errorMsg **C.char) (*session, error) {
 	cfg := config.NewIn(rPath, "")
 	apiClient := lfsapi.NewClient(cfg)
 
 	refUpdate := git.NewRefUpdate(cfg.Git, cfg.PushRemote(), cfg.CurrentRef(), nil)
 	lockClient := locking.NewClient(cfg.PushRemote(), apiClient, cfg)
 
-	tools.MkdirAll(cfg.LFSStorageDir(), cfg)
+	if err := tools.MkdirAll(cfg.LFSStorageDir(), cfg); err != nil {
+		lockClient.Close()
+		setErr(errorMsg, err.Error())
+		return nil, err
+	}
 	if err := lockClient.SetupFileCache(cfg.LFSStorageDir()); err != nil {
-		if errorMsg != nil {
-			*errorMsg = C.CString(err.Error())
-		}
-		return nil, nil, err
+		lockClient.Close()
+		setErr(errorMsg, err.Error())
+		return nil, err
 	}
 
 	lockClient.LocalWorkingDir = cfg.LocalWorkingDir()
@@ -46,40 +80,134 @@ func setupLockClient(rPath string, errorMsg **C.char) (*config.Configuration, *l
 	lockClient.SetLockableFilesReadOnly = cfg.SetLockableFilesReadOnly()
 	lockClient.RemoteRef = refUpdate.RemoteRef()
 
-	return cfg, lockClient, nil
+	return &session{cfg: cfg, apiClient: apiClient, lockClient: lockClient}, nil
+}
+
+// repoRelative converts an absolute or relative path into the repository-relative,
+// forward-slashed form the locking API expects.
+func (s *session) repoRelative(fPath string) (string, error) {
+	if !filepath.IsAbs(fPath) {
+		// Already relative; assume it is relative to the repository root.
+		return filepath.ToSlash(fPath), nil
+	}
+	rel, err := filepath.Rel(s.cfg.LocalWorkingDir(), fPath)
+	if err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(rel), nil
+}
+
+// goStrings converts a C array of C strings into a Go slice.
+func goStrings(argv **C.char, count int) []string {
+	if argv == nil || count <= 0 {
+		return nil
+	}
+	cSlice := unsafe.Slice(argv, count)
+	out := make([]string, count)
+	for i, s := range cSlice {
+		out[i] = C.GoString(s)
+	}
+	return out
+}
+
+// forEachConcurrent runs fn for each index in [0,n), at most limit at a time.
+func forEachConcurrent(n, limit int, fn func(i int)) {
+	if limit < 1 {
+		limit = 1
+	}
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			fn(i)
+		}(i)
+	}
+	wg.Wait()
+}
+
+// newPathResults allocates a C array of GitLFSPathResult, or reports failure if
+// the allocation could not be made.
+func newPathResults(count int) (C.GitLFSPathResultList, []C.GitLFSPathResult, bool) {
+	var empty C.GitLFSPathResultList
+	if count <= 0 {
+		return empty, nil, false
+	}
+	mem := C.malloc(C.size_t(count) * C.size_t(unsafe.Sizeof(C.GitLFSPathResult{})))
+	if mem == nil {
+		return empty, nil, false
+	}
+	arr := (*C.GitLFSPathResult)(mem)
+	return C.GitLFSPathResultList{Results: arr, Count: C.int(count)},
+		unsafe.Slice(arr, count), true
+}
+
+// bulk is the shared body of GitLFS_LockMany and GitLFS_UnlockMany.
+func bulk(repoPath *C.char, filePaths **C.char, count C.int, errorMsg **C.char,
+	op func(s *session, rel string) error) C.GitLFSPathResultList {
+
+	var empty C.GitLFSPathResultList
+	clearErr(errorMsg)
+
+	paths := goStrings(filePaths, int(count))
+	if len(paths) == 0 {
+		return empty
+	}
+
+	s, err := newSession(C.GoString(repoPath), errorMsg)
+	if err != nil {
+		return empty
+	}
+	defer s.Close()
+
+	list, slice, ok := newPathResults(len(paths))
+	if !ok {
+		setErr(errorMsg, "failed to allocate result array")
+		return empty
+	}
+
+	// Each goroutine writes only to its own index, so the C array needs no
+	// additional synchronisation.
+	forEachConcurrent(len(paths), s.apiClient.ConcurrentTransfers(), func(i int) {
+		slice[i].Path = C.CString(paths[i])
+		slice[i].Success = 0
+		slice[i].Error = nil
+
+		rel, err := s.repoRelative(paths[i])
+		if err != nil {
+			slice[i].Error = C.CString(err.Error())
+			return
+		}
+		if err := op(s, rel); err != nil {
+			slice[i].Error = C.CString(err.Error())
+			return
+		}
+		slice[i].Success = 1
+	})
+
+	return list
 }
 
 //export GitLFS_Lock
 func GitLFS_Lock(repoPath *C.char, filePath *C.char, errorMsg **C.char) C.int {
-	rPath := C.GoString(repoPath)
-	fPath := C.GoString(filePath)
+	clearErr(errorMsg)
 
-	cfg, lockClient, err := setupLockClient(rPath, errorMsg)
+	s, err := newSession(C.GoString(repoPath), errorMsg)
 	if err != nil {
 		return 1
 	}
-	defer lockClient.Close()
+	defer s.Close()
 
-	// Convert fPath (absolute or relative) into a path relative to the repo root
-	var relPath string
-	if filepath.IsAbs(fPath) {
-		relPath, err = filepath.Rel(cfg.LocalWorkingDir(), fPath)
-		if err != nil {
-			if errorMsg != nil {
-				*errorMsg = C.CString(err.Error())
-			}
-			return 1
-		}
-	} else {
-		// If already relative, assuming it's relative to the repo root for this API
-		relPath = fPath
-	}
-
-	_, err = lockClient.LockFile(filepath.ToSlash(relPath))
+	rel, err := s.repoRelative(C.GoString(filePath))
 	if err != nil {
-		if errorMsg != nil {
-			*errorMsg = C.CString(err.Error())
-		}
+		setErr(errorMsg, err.Error())
+		return 1
+	}
+	if _, err := s.lockClient.LockFile(rel); err != nil {
+		setErr(errorMsg, err.Error())
 		return 1
 	}
 	return 0
@@ -87,66 +215,70 @@ func GitLFS_Lock(repoPath *C.char, filePath *C.char, errorMsg **C.char) C.int {
 
 //export GitLFS_Unlock
 func GitLFS_Unlock(repoPath *C.char, filePath *C.char, force C.int, errorMsg **C.char) C.int {
-	rPath := C.GoString(repoPath)
-	fPath := C.GoString(filePath)
+	clearErr(errorMsg)
 
-	cfg, lockClient, err := setupLockClient(rPath, errorMsg)
+	s, err := newSession(C.GoString(repoPath), errorMsg)
 	if err != nil {
 		return 1
 	}
-	defer lockClient.Close()
+	defer s.Close()
 
-	var relPath string
-	if filepath.IsAbs(fPath) {
-		relPath, err = filepath.Rel(cfg.LocalWorkingDir(), fPath)
-		if err != nil {
-			if errorMsg != nil {
-				*errorMsg = C.CString(err.Error())
-			}
-			return 1
-		}
-	} else {
-		relPath = fPath
-	}
-
-	err = lockClient.UnlockFile(filepath.ToSlash(relPath), force != 0)
+	rel, err := s.repoRelative(C.GoString(filePath))
 	if err != nil {
-		if errorMsg != nil {
-			*errorMsg = C.CString(err.Error())
-		}
+		setErr(errorMsg, err.Error())
+		return 1
+	}
+	if err := s.lockClient.UnlockFile(rel, force != 0); err != nil {
+		setErr(errorMsg, err.Error())
 		return 1
 	}
 	return 0
 }
 
+//export GitLFS_LockMany
+func GitLFS_LockMany(repoPath *C.char, filePaths **C.char, count C.int, errorMsg **C.char) C.GitLFSPathResultList {
+	return bulk(repoPath, filePaths, count, errorMsg, func(s *session, rel string) error {
+		_, err := s.lockClient.LockFile(rel)
+		return err
+	})
+}
+
+//export GitLFS_UnlockMany
+func GitLFS_UnlockMany(repoPath *C.char, filePaths **C.char, count C.int, force C.int, errorMsg **C.char) C.GitLFSPathResultList {
+	return bulk(repoPath, filePaths, count, errorMsg, func(s *session, rel string) error {
+		return s.lockClient.UnlockFile(rel, force != 0)
+	})
+}
+
 //export GitLFS_Locks
-func GitLFS_Locks(repoPath *C.char, errorMsg **C.char) C.GitLFSLockList {
-	var emptyList C.GitLFSLockList
-	rPath := C.GoString(repoPath)
+func GitLFS_Locks(repoPath *C.char, cached C.int, localOnly C.int, errorMsg **C.char) C.GitLFSLockList {
+	var empty C.GitLFSLockList
+	clearErr(errorMsg)
 
-	_, lockClient, err := setupLockClient(rPath, errorMsg)
+	s, err := newSession(C.GoString(repoPath), errorMsg)
 	if err != nil {
-		return emptyList
+		return empty
 	}
-	defer lockClient.Close()
+	defer s.Close()
 
-	// Get all locks
-	locks, err := lockClient.SearchLocks(nil, 0, false, false)
+	locks, err := s.lockClient.SearchLocks(nil, 0, localOnly != 0, cached != 0)
 	if err != nil {
-		if errorMsg != nil {
-			*errorMsg = C.CString(err.Error())
-		}
-		return emptyList
+		setErr(errorMsg, err.Error())
+		return empty
 	}
 
 	count := len(locks)
 	if count == 0 {
-		return emptyList
+		return empty
 	}
 
-	// Allocate array of GitLFSLock in C
-	cArray := (*C.GitLFSLock)(C.malloc(C.size_t(count) * C.size_t(unsafe.Sizeof(C.GitLFSLock{}))))
-	slice := (*[1 << 30]C.GitLFSLock)(unsafe.Pointer(cArray))[:count:count]
+	mem := C.malloc(C.size_t(count) * C.size_t(unsafe.Sizeof(C.GitLFSLock{})))
+	if mem == nil {
+		setErr(errorMsg, "failed to allocate lock array")
+		return empty
+	}
+	cArray := (*C.GitLFSLock)(mem)
+	slice := unsafe.Slice(cArray, count)
 
 	for i, lock := range locks {
 		slice[i].Id = C.CString(lock.Id)
@@ -159,42 +291,38 @@ func GitLFS_Locks(repoPath *C.char, errorMsg **C.char) C.GitLFSLockList {
 		}
 	}
 
-	return C.GitLFSLockList{
-		Locks: cArray,
-		Count: C.int(count),
-	}
+	return C.GitLFSLockList{Locks: cArray, Count: C.int(count)}
 }
 
 //export GitLFS_FreeLocks
 func GitLFS_FreeLocks(list C.GitLFSLockList) {
-	if list.Locks == nil || list.Count == 0 {
+	if list.Locks == nil || list.Count <= 0 {
 		return
 	}
-
-	count := int(list.Count)
-	slice := (*[1 << 30]C.GitLFSLock)(unsafe.Pointer(list.Locks))[:count:count]
-
-	for i := 0; i < count; i++ {
-		if slice[i].Id != nil {
-			C.free(unsafe.Pointer(slice[i].Id))
-		}
-		if slice[i].Path != nil {
-			C.free(unsafe.Pointer(slice[i].Path))
-		}
-		if slice[i].LockedAt != nil {
-			C.free(unsafe.Pointer(slice[i].LockedAt))
-		}
-		if slice[i].OwnerName != nil {
-			C.free(unsafe.Pointer(slice[i].OwnerName))
-		}
+	slice := unsafe.Slice(list.Locks, int(list.Count))
+	for i := range slice {
+		C.free(unsafe.Pointer(slice[i].Id))
+		C.free(unsafe.Pointer(slice[i].Path))
+		C.free(unsafe.Pointer(slice[i].LockedAt))
+		C.free(unsafe.Pointer(slice[i].OwnerName))
 	}
-
 	C.free(unsafe.Pointer(list.Locks))
+}
+
+//export GitLFS_FreePathResults
+func GitLFS_FreePathResults(list C.GitLFSPathResultList) {
+	if list.Results == nil || list.Count <= 0 {
+		return
+	}
+	slice := unsafe.Slice(list.Results, int(list.Count))
+	for i := range slice {
+		C.free(unsafe.Pointer(slice[i].Path))
+		C.free(unsafe.Pointer(slice[i].Error))
+	}
+	C.free(unsafe.Pointer(list.Results))
 }
 
 //export GitLFS_FreeError
 func GitLFS_FreeError(errMsg *C.char) {
-	if errMsg != nil {
-		C.free(unsafe.Pointer(errMsg))
-	}
+	C.free(unsafe.Pointer(errMsg))
 }

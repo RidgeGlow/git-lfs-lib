@@ -50,9 +50,45 @@ kept in the same directory.
 
 ## Consuming
 
-The C API is declared in `libgitlfs.h`. All functions returning allocated memory
-have a matching free function — `GitLFS_FreeLocks` and `GitLFS_FreeError` — and
-callers should zero-initialise their `char *errorMsg` before each call.
+The C API is declared in `libgitlfs.h`. It covers the locking surface that
+[RidgeGlowUnrealGit](https://github.com/RidgeGlow/RidgeGlowUnrealGit) currently
+gets by shelling out to a bundled `git-lfs` binary — that plugin uses the
+bundled binary *only* for locking (`lock`, `unlock`, `locks`); everything else
+goes through plain `git`.
+
+| Need | Entry point |
+|---|---|
+| `git lfs lock <path>` | `GitLFS_Lock` |
+| `git lfs unlock <path>` | `GitLFS_Unlock` |
+| `git lfs lock <many paths>` | `GitLFS_LockMany` |
+| `git lfs unlock <many paths>` | `GitLFS_UnlockMany` |
+| `git lfs locks` | `GitLFS_Locks(cached=0, localOnly=0)` |
+| `git lfs locks --cached` | `GitLFS_Locks(cached=1, localOnly=0)` |
+| `git lfs locks --local` | `GitLFS_Locks(cached=0, localOnly=1)` |
+
+### Bulk operations
+
+Use `GitLFS_LockMany` / `GitLFS_UnlockMany` for anything touching more than one
+file, such as locking a whole directory. They build the configuration, API
+client, and lock cache **once** and then issue the requests concurrently, bounded
+by `lfs.concurrenttransfers`. Looping over the single-file entry points instead
+would repeat that setup per file and serialise every request.
+
+The CLI needed a `MaxFilesPerBatch` chunking dance to stay under command-line
+length limits. That constraint does not exist here: pass the whole list.
+
+Bulk calls are **partial-success**. `errorMsg` is set only when the entire batch
+could not start (for example the repository could not be opened), in which case
+`Count` is 0. Otherwise every path gets an entry and you must inspect each
+`Success` field.
+
+### Memory and error handling
+
+Every function returning allocated memory has a matching free function:
+`GitLFS_FreeLocks`, `GitLFS_FreePathResults`, and `GitLFS_FreeError`.
+
+`errorMsg` is cleared to `NULL` on entry to every function, so it is safe to
+check after a call without pre-initialising it.
 
 Note that the Windows archive is produced by MinGW. Linking a Go `c-archive`
 into an MSVC-built program is not a well-trodden path; if the consumer is MSVC

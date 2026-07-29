@@ -69,7 +69,8 @@ jobs:
         esac
         # ...and must actually export the entry points.
         for sym in GitLFS_Lock GitLFS_Unlock GitLFS_Locks \
-                   GitLFS_FreeLocks GitLFS_FreeError; do
+                   GitLFS_LockMany GitLFS_UnlockMany \
+                   GitLFS_FreeLocks GitLFS_FreePathResults GitLFS_FreeError; do
           grep -qa "$sym" "$archive" \
             || { echo "::error::$archive is missing symbol $sym"; exit 1; }
         done
