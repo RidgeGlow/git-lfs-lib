@@ -29,10 +29,10 @@ func main() {
 func setupLockClient(rPath string, errorMsg **C.char) (*config.Configuration, *locking.Client, error) {
 	cfg := config.NewIn(rPath, "")
 	apiClient := lfsapi.NewClient(cfg)
-	
+
 	refUpdate := git.NewRefUpdate(cfg.Git, cfg.PushRemote(), cfg.CurrentRef(), nil)
 	lockClient := locking.NewClient(cfg.PushRemote(), apiClient, cfg)
-	
+
 	tools.MkdirAll(cfg.LFSStorageDir(), cfg)
 	if err := lockClient.SetupFileCache(cfg.LFSStorageDir()); err != nil {
 		if errorMsg != nil {
