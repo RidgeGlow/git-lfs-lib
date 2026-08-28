@@ -1,12 +1,5 @@
 name: CI
-# RidgeGlow: the only deviation from upstream in this file, kept to one hunk.
-# Upstream reads:
-#   on: [push, pull_request]
-# which builds every branch push twice, once per event, and rebuilds for
-# documentation-only changes. To resolve a conflict here, take upstream's line
-# and re-apply this block.
-#
-# This workflow has no tag trigger, so paths-ignore is safe on both events.
+# RidgeGlow fork-local. Upstream is `on: [push, pull_request]`; re-apply on sync.
 on:
   push:
     branches: [main]
@@ -16,8 +9,6 @@ on:
     paths-ignore:
       - '**/*.md'
 
-# Superseding a PR cancels the run it replaced. Limited to pull_request: a push
-# to main must not be interrupted by whatever lands next.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
