@@ -11,7 +11,9 @@ package main
 import "C"
 
 import (
+	"fmt"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"time"
 	"unsafe"
@@ -55,6 +57,73 @@ func clearErr(errorMsg **C.char) {
 	if errorMsg != nil {
 		*errorMsg = nil
 	}
+}
+
+// A panic that escapes a //export'ed function aborts the host process: there is
+// no C++ exception for the caller to catch and no way for it to intervene. Every
+// entry point below therefore installs one of the recover helpers here, turning
+// a bug in this library or its dependencies into a failed operation rather than
+// a dead editor.
+//
+// Each helper must be deferred *directly* (`defer recoverInt(...)`), never
+// wrapped in a closure — recover() only reports a panic when called by the
+// deferred function itself.
+//
+// These catch panics only. Go runtime *fatal* errors — concurrent map write,
+// stack exhaustion, out of memory, deadlock detection — and genuine segfaults
+// bypass recover() and still abort the process.
+
+func panicMessage(what string, r any) string {
+	return fmt.Sprintf("libgitlfs: panic in %s: %v\n\n%s", what, r, debug.Stack())
+}
+
+func recoverInt(errorMsg **C.char, what string, result *C.int) {
+	if r := recover(); r != nil {
+		setErr(errorMsg, panicMessage(what, r))
+		*result = 1
+	}
+}
+
+// recoverLockList reports the panic and yields an empty list. Any entries already
+// written are leaked rather than freed: the array is only partially initialised at
+// this point, so walking it to free would risk a second fault on a garbage pointer.
+func recoverLockList(errorMsg **C.char, what string, result *C.GitLFSLockList) {
+	if r := recover(); r != nil {
+		setErr(errorMsg, panicMessage(what, r))
+		var empty C.GitLFSLockList
+		*result = empty
+	}
+}
+
+// recoverPathResults yields an empty list, with the same partial-initialisation
+// caveat as recoverLockList.
+func recoverPathResults(errorMsg **C.char, what string, result *C.GitLFSPathResultList) {
+	if r := recover(); r != nil {
+		setErr(errorMsg, panicMessage(what, r))
+		var empty C.GitLFSPathResultList
+		*result = empty
+	}
+}
+
+// recoverPathResult handles a panic in the per-path worker inside bulk. This one
+// is essential rather than defensive: the workers run on their own goroutines, so
+// a panic there cannot be recovered by the caller's defer and would take the
+// process down regardless of what the exported function does.
+func recoverPathResult(res *C.GitLFSPathResult, what string) {
+	if r := recover(); r != nil {
+		res.Success = 0
+		if res.Error == nil {
+			res.Error = C.CString(panicMessage(what, r))
+		}
+	}
+}
+
+// recoverFree absorbs a panic in the deallocation entry points, which have no
+// error channel to report through. Swallowing is strictly better than aborting
+// the caller; a genuine double free or bad pointer would fault rather than panic
+// and is beyond reach either way.
+func recoverFree() {
+	_ = recover()
 }
 
 func newSession(rPath string, errorMsg **C.char) (*session, error) {
@@ -176,6 +245,8 @@ func bulk(repoPath *C.char, filePaths **C.char, count C.int, errorMsg **C.char,
 		slice[i].Success = 0
 		slice[i].Error = nil
 
+		defer recoverPathResult(&slice[i], "bulk worker")
+
 		rel, err := s.repoRelative(paths[i])
 		if err != nil {
 			slice[i].Error = C.CString(err.Error())
@@ -192,8 +263,9 @@ func bulk(repoPath *C.char, filePaths **C.char, count C.int, errorMsg **C.char,
 }
 
 //export GitLFS_Lock
-func GitLFS_Lock(repoPath *C.char, filePath *C.char, errorMsg **C.char) C.int {
+func GitLFS_Lock(repoPath *C.char, filePath *C.char, errorMsg **C.char) (result C.int) {
 	clearErr(errorMsg)
+	defer recoverInt(errorMsg, "GitLFS_Lock", &result)
 
 	s, err := newSession(C.GoString(repoPath), errorMsg)
 	if err != nil {
@@ -214,8 +286,9 @@ func GitLFS_Lock(repoPath *C.char, filePath *C.char, errorMsg **C.char) C.int {
 }
 
 //export GitLFS_Unlock
-func GitLFS_Unlock(repoPath *C.char, filePath *C.char, force C.int, errorMsg **C.char) C.int {
+func GitLFS_Unlock(repoPath *C.char, filePath *C.char, force C.int, errorMsg **C.char) (result C.int) {
 	clearErr(errorMsg)
+	defer recoverInt(errorMsg, "GitLFS_Unlock", &result)
 
 	s, err := newSession(C.GoString(repoPath), errorMsg)
 	if err != nil {
@@ -236,7 +309,9 @@ func GitLFS_Unlock(repoPath *C.char, filePath *C.char, force C.int, errorMsg **C
 }
 
 //export GitLFS_LockMany
-func GitLFS_LockMany(repoPath *C.char, filePaths **C.char, count C.int, errorMsg **C.char) C.GitLFSPathResultList {
+func GitLFS_LockMany(repoPath *C.char, filePaths **C.char, count C.int, errorMsg **C.char) (result C.GitLFSPathResultList) {
+	defer recoverPathResults(errorMsg, "GitLFS_LockMany", &result)
+
 	return bulk(repoPath, filePaths, count, errorMsg, func(s *session, rel string) error {
 		_, err := s.lockClient.LockFile(rel)
 		return err
@@ -244,16 +319,19 @@ func GitLFS_LockMany(repoPath *C.char, filePaths **C.char, count C.int, errorMsg
 }
 
 //export GitLFS_UnlockMany
-func GitLFS_UnlockMany(repoPath *C.char, filePaths **C.char, count C.int, force C.int, errorMsg **C.char) C.GitLFSPathResultList {
+func GitLFS_UnlockMany(repoPath *C.char, filePaths **C.char, count C.int, force C.int, errorMsg **C.char) (result C.GitLFSPathResultList) {
+	defer recoverPathResults(errorMsg, "GitLFS_UnlockMany", &result)
+
 	return bulk(repoPath, filePaths, count, errorMsg, func(s *session, rel string) error {
 		return s.lockClient.UnlockFile(rel, force != 0)
 	})
 }
 
 //export GitLFS_Locks
-func GitLFS_Locks(repoPath *C.char, cached C.int, localOnly C.int, errorMsg **C.char) C.GitLFSLockList {
+func GitLFS_Locks(repoPath *C.char, cached C.int, localOnly C.int, errorMsg **C.char) (result C.GitLFSLockList) {
 	var empty C.GitLFSLockList
 	clearErr(errorMsg)
+	defer recoverLockList(errorMsg, "GitLFS_Locks", &result)
 
 	s, err := newSession(C.GoString(repoPath), errorMsg)
 	if err != nil {
@@ -296,6 +374,8 @@ func GitLFS_Locks(repoPath *C.char, cached C.int, localOnly C.int, errorMsg **C.
 
 //export GitLFS_FreeLocks
 func GitLFS_FreeLocks(list C.GitLFSLockList) {
+	defer recoverFree()
+
 	if list.Locks == nil || list.Count <= 0 {
 		return
 	}
@@ -311,6 +391,8 @@ func GitLFS_FreeLocks(list C.GitLFSLockList) {
 
 //export GitLFS_FreePathResults
 func GitLFS_FreePathResults(list C.GitLFSPathResultList) {
+	defer recoverFree()
+
 	if list.Results == nil || list.Count <= 0 {
 		return
 	}
@@ -324,5 +406,7 @@ func GitLFS_FreePathResults(list C.GitLFSPathResultList) {
 
 //export GitLFS_FreeError
 func GitLFS_FreeError(errMsg *C.char) {
+	defer recoverFree()
+
 	C.free(unsafe.Pointer(errMsg))
 }
