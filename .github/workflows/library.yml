@@ -22,7 +22,23 @@ on:
   push:
     branches: [main]
     tags: ['lib-v*']
+  # Documentation-only changes cannot affect the artifacts, so skip them here.
+  # Deliberately not applied to push above: that trigger carries the lib-v* tags
+  # that publish releases, and a release commit that happened to touch only
+  # documentation would then silently never build.
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+
+# Superseding a PR with a new push cancels the run it replaced; there is no
+# value in finishing a build for a commit nobody will merge.
+#
+# Cancellation is limited to pull_request on purpose. A tag push publishes the
+# release, and a main push is the branch releases are cut from -- neither may be
+# interrupted by whatever lands next.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   GOTOOLCHAIN: local

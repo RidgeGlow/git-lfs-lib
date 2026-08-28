@@ -20,12 +20,21 @@ built entirely from **additive** files:
 `git-lfs.go` and `.github/workflows/release.yml` are byte-identical to upstream
 and must stay that way. Syncing upstream should be a clean fast-forward for both.
 
-`ci.yml` carries exactly one deviation: upstream's `on: [push, pull_request]`
-builds every branch push twice, once per event, at ten jobs a run. We restrict
-`push` to `main` and let `pull_request` cover branches. It is a single hunk at
-the top of the file, commented in place with upstream's original line, so a
-conflict is resolved by taking upstream's version and re-applying the
-restriction. Keep it that way — do not let edits to this file spread.
+`ci.yml` carries exactly one deviation, a single hunk at the top of the file
+replacing upstream's `on: [push, pull_request]`. That line builds every branch
+push twice, once per event, at ten jobs a run, and rebuilds for documentation-only
+changes. In its place: `push` restricted to `main`, `paths-ignore` for markdown,
+and a `concurrency` group so a new push supersedes the run it replaced.
+
+Upstream's original line is recorded in a comment beside it, so a conflict is
+resolved by taking upstream's version and re-applying the block. Keep it to that
+one hunk — do not let edits to this file spread.
+
+`library.yml` has the same concurrency group, but **no `paths-ignore` on its
+push trigger**: that trigger carries the `lib-v*` tags that publish releases, and
+a release commit touching only documentation would otherwise never build.
+Cancellation is likewise limited to `pull_request` in both files, so a release or
+a `main` build is never interrupted by whatever lands next.
 
 This is why the library lives in its own package directory rather than at the
 repository root: a root-level `libgitlfs.go` would collide with `git-lfs.go`'s
