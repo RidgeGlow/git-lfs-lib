@@ -14,11 +14,18 @@ built entirely from **additive** files:
 |---|---|
 | `libgitlfs/` | ours |
 | `.github/workflows/library.yml` | ours |
+| `.github/workflows/ci.yml` | upstream — **one** deliberate hunk, see below |
 | everything else | upstream — do not modify |
 
-Notably `git-lfs.go`, `.github/workflows/ci.yml`, and
-`.github/workflows/release.yml` are byte-identical to upstream and must stay
-that way. Syncing upstream should be a clean fast-forward for all of them.
+`git-lfs.go` and `.github/workflows/release.yml` are byte-identical to upstream
+and must stay that way. Syncing upstream should be a clean fast-forward for both.
+
+`ci.yml` carries exactly one deviation: upstream's `on: [push, pull_request]`
+builds every branch push twice, once per event, at ten jobs a run. We restrict
+`push` to `main` and let `pull_request` cover branches. It is a single hunk at
+the top of the file, commented in place with upstream's original line, so a
+conflict is resolved by taking upstream's version and re-applying the
+restriction. Keep it that way — do not let edits to this file spread.
 
 This is why the library lives in its own package directory rather than at the
 repository root: a root-level `libgitlfs.go` would collide with `git-lfs.go`'s

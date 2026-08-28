@@ -1,5 +1,13 @@
 name: CI
-on: [push, pull_request]
+# RidgeGlow: the only deviation from upstream in this file. Upstream reads
+#   on: [push, pull_request]
+# which builds every branch push twice, once per event. Restricting push to main
+# leaves pull_request to cover branches. To resolve a conflict here, take
+# upstream's line and re-apply this restriction.
+on:
+  push:
+    branches: [main]
+  pull_request:
 env:
   GOTOOLCHAIN: local
 
