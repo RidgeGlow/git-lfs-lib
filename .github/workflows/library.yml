@@ -55,9 +55,9 @@ jobs:
           # Build ./libgitlfs, never the repo root: the root accumulates a
           # resource.syso from goversioninfo whose architecture is whatever was
           # built last, which a root-level build would silently absorb.
-          CGO_ENABLED=1 go build -buildmode=c-shared -tags libgitlfs \
+          CGO_ENABLED=1 go build -buildvcs=false -buildmode=c-shared -tags libgitlfs \
             -o dist/libgitlfs-windows-amd64.dll ./libgitlfs
-          CGO_ENABLED=1 go build -buildmode=c-archive -tags libgitlfs \
+          CGO_ENABLED=1 go build -buildvcs=false -buildmode=c-archive -tags libgitlfs \
             -o dist/libgitlfs-windows-amd64.lib ./libgitlfs
           cp libgitlfs/libgitlfs.h dist/
           # The c-shared build also emits an import library; we load the DLL
@@ -122,11 +122,11 @@ jobs:
           LDFLAGS="-extldflags '-Wl,-install_name,@rpath/libgitlfs.dylib'"
 
           CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 CC="clang -arch arm64" \
-            go build -buildmode=c-shared -tags libgitlfs \
+            go build -buildvcs=false -buildmode=c-shared -tags libgitlfs \
             -ldflags="$LDFLAGS" -o build/arm64.dylib ./libgitlfs
 
           CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 CC="clang -arch x86_64" \
-            go build -buildmode=c-shared -tags libgitlfs \
+            go build -buildvcs=false -buildmode=c-shared -tags libgitlfs \
             -ldflags="$LDFLAGS" -o build/amd64.dylib ./libgitlfs
 
           lipo -create build/arm64.dylib build/amd64.dylib \
@@ -134,9 +134,9 @@ jobs:
 
           # lipo works on static archives too, so the c-archive is universal as well.
           CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 CC="clang -arch arm64" \
-            go build -buildmode=c-archive -tags libgitlfs -o build/arm64.a ./libgitlfs
+            go build -buildvcs=false -buildmode=c-archive -tags libgitlfs -o build/arm64.a ./libgitlfs
           CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 CC="clang -arch x86_64" \
-            go build -buildmode=c-archive -tags libgitlfs -o build/amd64.a ./libgitlfs
+            go build -buildvcs=false -buildmode=c-archive -tags libgitlfs -o build/amd64.a ./libgitlfs
           lipo -create build/arm64.a build/amd64.a -output dist/libgitlfs-darwin-universal.a
 
           cp libgitlfs/libgitlfs.h dist/
@@ -171,7 +171,11 @@ jobs:
           done
 
           # Dependency closure must be system-only.
-          deps="$(otool -L "$dylib" | tail -n +2 | awk '{print $1}')"
+          # Select on indentation rather than skipping a fixed number of lines:
+          # otool -L prints one unindented "<file> (architecture X):" header per
+          # slice, so a universal binary has several, and only the dependency
+          # lines themselves are tab-indented.
+          deps="$(otool -L "$dylib" | grep -E '^[[:space:]]' | awk '{print $1}' | sort -u)"
           echo "$deps"
           if echo "$deps" | grep -vqE '^(/usr/lib/|/System/Library/Frameworks/|@rpath/libgitlfs)'; then
             echo "::error::$dylib links a non-system library that will not exist on a user machine"
@@ -217,9 +221,9 @@ jobs:
         run: |
           set -eu
           mkdir -p dist
-          CGO_ENABLED=1 go build -buildmode=c-shared -tags libgitlfs \
+          CGO_ENABLED=1 go build -buildvcs=false -buildmode=c-shared -tags libgitlfs \
             -o dist/libgitlfs-linux-amd64.so ./libgitlfs
-          CGO_ENABLED=1 go build -buildmode=c-archive -tags libgitlfs \
+          CGO_ENABLED=1 go build -buildvcs=false -buildmode=c-archive -tags libgitlfs \
             -o dist/libgitlfs-linux-amd64.a ./libgitlfs
           cp libgitlfs/libgitlfs.h dist/
           ls -l dist
