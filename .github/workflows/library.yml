@@ -16,8 +16,11 @@ name: Library
 # or depend on ci.yml or release.yml, so those files can be fast-forwarded from
 # upstream without conflicts. See libgitlfs/README.md.
 on:
+  # Restricted to main and tags on purpose. Building every branch push as well
+  # as its pull_request ran this matrix twice for the same commit, and it is not
+  # a cheap matrix: three platforms, two build modes each, one in a container.
   push:
-    branches: ['**']
+    branches: [main]
     tags: ['lib-v*']
   pull_request:
 
