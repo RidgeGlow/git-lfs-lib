@@ -1,82 +1,323 @@
 name: Library
 
-# Builds libgitlfs as a C-compatible static archive for each supported platform.
+# Builds libgitlfs as a C-compatible library for each platform the Unreal editor
+# runs on, and publishes them on a lib-v* tag.
+#
+# The shared library is the primary artifact. Unreal loads it with
+# FPlatformProcess::GetDllHandle rather than linking it, which keeps MinGW's CRT
+# inside the library and avoids linking a Go c-archive with MSVC. The c-archive
+# is still built so that option stays open.
+#
+# Because nothing links against it, the risks that remain are the library's own
+# dependency closure and platform floors. Every "Verify" step below is a gate on
+# exactly that, not a formality.
 #
 # This workflow is intentionally self-contained and additive: it does not modify
 # or depend on ci.yml or release.yml, so those files can be fast-forwarded from
 # upstream without conflicts. See libgitlfs/README.md.
-on: [push, pull_request]
+on:
+  # Restricted to main and tags on purpose. Building every branch push as well
+  # as its pull_request ran this matrix twice for the same commit, and it is not
+  # a cheap matrix: three platforms, two build modes each, one in a container.
+  push:
+    branches: [main]
+    tags: ['lib-v*']
+  # Documentation-only changes cannot affect the artifacts, so skip them here.
+  # Deliberately not applied to push above: that trigger carries the lib-v* tags
+  # that publish releases, and a release commit that happened to touch only
+  # documentation would then silently never build.
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+
+# Superseding a PR with a new push cancels the run it replaced; there is no
+# value in finishing a build for a commit nobody will merge.
+#
+# Cancellation is limited to pull_request on purpose. A tag push publishes the
+# release, and a main push is the branch releases are cut from -- neither may be
+# interrupted by whatever lands next.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   GOTOOLCHAIN: local
+  GO_VERSION: '1.26.x'
+  # The complete exported surface. Every artifact must expose all of these.
+  EXPORTS: >-
+    GitLFS_Lock GitLFS_Unlock GitLFS_Locks
+    GitLFS_LockMany GitLFS_UnlockMany
+    GitLFS_FreeLocks GitLFS_FreePathResults GitLFS_FreeError
 
 jobs:
-  build:
-    name: Build library (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      # Each platform is independent; a failure on one must not cancel the
-      # others, otherwise a single break hides the state of every other target.
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+  windows:
+    name: Build windows-amd64
+    runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v7
-      with:
-        persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-    - uses: actions/setup-go@v6
-      with:
-        go-version: '1.26.x'
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
 
-    # cgo needs a gcc-compatible toolchain. The Git for Windows SDK provides
-    # MinGW; MSVC cannot drive cgo.
-    - uses: git-for-windows/setup-git-for-windows-sdk@v2
-      if: runner.os == 'Windows'
+      # cgo needs a gcc-compatible toolchain. The Git for Windows SDK provides
+      # MinGW; MSVC cannot drive cgo.
+      - uses: git-for-windows/setup-git-for-windows-sdk@v2
 
-    - name: Build static archive
-      shell: bash
-      run: |
-        set -eu
-        # Derive the label from the toolchain rather than from the runner
-        # label, so an artifact can never claim an architecture it isn't.
-        GOOS="$(go env GOOS)"
-        GOARCH="$(go env GOARCH)"
-        case "$GOOS" in
-          windows) EXT=lib ;;
-          *)       EXT=a   ;;
-        esac
-        NAME="libgitlfs-${GOOS}-${GOARCH}"
-        mkdir -p dist
-        CGO_ENABLED=1 go build -buildmode=c-archive -tags libgitlfs \
-          -o "dist/${NAME}.${EXT}" ./libgitlfs
-        cp libgitlfs/libgitlfs.h dist/
-        ls -l dist
+      - name: Build
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p dist
+          # Build ./libgitlfs, never the repo root: the root accumulates a
+          # resource.syso from goversioninfo whose architecture is whatever was
+          # built last, which a root-level build would silently absorb.
+          CGO_ENABLED=1 go build -buildvcs=false -buildmode=c-shared -tags libgitlfs \
+            -o dist/libgitlfs-windows-amd64.dll ./libgitlfs
+          CGO_ENABLED=1 go build -buildvcs=false -buildmode=c-archive -tags libgitlfs \
+            -o dist/libgitlfs-windows-amd64.lib ./libgitlfs
+          cp libgitlfs/libgitlfs.h dist/
+          # The c-shared build also emits an import library; we load the DLL
+          # explicitly and never link, so it is not shipped.
+          rm -f dist/libgitlfs-windows-amd64.a
+          ls -l dist
 
-    - name: Verify archive
-      shell: bash
-      run: |
-        set -eu
-        # find, not a glob: `ls *.a *.lib` reports failure for whichever
-        # pattern does not match on this platform, and pipefail turns that
-        # into a step failure even though the archive was found.
-        archive="$(find dist -maxdepth 1 \( -name '*.a' -o -name '*.lib' \) | head -n1)"
-        [ -n "$archive" ] || { echo "::error::no archive was produced"; exit 1; }
-        # A c-archive must be a real ar archive...
-        case "$(head -c 8 "$archive")" in
-          '!<arch>'*) ;;
-          *) echo "::error::$archive is not an ar archive"; exit 1 ;;
-        esac
-        # ...and must actually export the entry points.
-        for sym in GitLFS_Lock GitLFS_Unlock GitLFS_Locks \
-                   GitLFS_LockMany GitLFS_UnlockMany \
-                   GitLFS_FreeLocks GitLFS_FreePathResults GitLFS_FreeError; do
-          grep -qa "$sym" "$archive" \
-            || { echo "::error::$archive is missing symbol $sym"; exit 1; }
-        done
-        echo "$archive: ar archive, all exported symbols present"
+      - name: Verify
+        shell: bash
+        run: |
+          set -eu
+          dll=dist/libgitlfs-windows-amd64.dll
 
-    - uses: actions/upload-artifact@v7
-      with:
-        name: libgitlfs-${{ matrix.os }}
-        path: dist
+          # Exports must be present and externally visible.
+          for sym in $EXPORTS; do
+            objdump -p "$dll" | grep -q "\b${sym}\b" \
+              || { echo "::error::$dll does not export $sym"; exit 1; }
+          done
+
+          # Dependency closure must be system-only. Go c-shared links the MinGW
+          # runtime statically, but a regression here would mean the DLL simply
+          # fails to load on a customer machine, so assert it rather than assume.
+          deps="$(objdump -p "$dll" | sed -n 's/^\s*DLL Name:\s*//p' | tr 'A-Z' 'a-z' | sort -u)"
+          echo "$deps"
+          if echo "$deps" | grep -qE 'libgcc|libwinpthread|libstdc\+\+|msys-'; then
+            echo "::error::$dll imports a MinGW runtime DLL that will not exist on a user machine"
+            exit 1
+          fi
+          echo "windows-amd64 OK"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libgitlfs-windows-amd64
+          path: dist
+
+  macos:
+    name: Build darwin-universal
+    runs-on: macos-latest
+    # Pinned below any UE 5.x minimum. Building against a newer SDK default would
+    # stamp a minos the editor's host OS may not satisfy, and the only symptom
+    # would be a silent fall back to the process path.
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build both slices and lipo
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p dist build
+          # The Mac editor is universal, so both slices are required. macos-latest
+          # is Apple Silicon, so amd64 is a cross build.
+          # -install_name is harmless for our dlopen-by-absolute-path usage, but
+          # keeps the library correct if anything ever does link it.
+          LDFLAGS="-extldflags '-Wl,-install_name,@rpath/libgitlfs.dylib'"
+
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 CC="clang -arch arm64" \
+            go build -buildvcs=false -buildmode=c-shared -tags libgitlfs \
+            -ldflags="$LDFLAGS" -o build/arm64.dylib ./libgitlfs
+
+          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 CC="clang -arch x86_64" \
+            go build -buildvcs=false -buildmode=c-shared -tags libgitlfs \
+            -ldflags="$LDFLAGS" -o build/amd64.dylib ./libgitlfs
+
+          lipo -create build/arm64.dylib build/amd64.dylib \
+            -output dist/libgitlfs-darwin-universal.dylib
+
+          # lipo works on static archives too, so the c-archive is universal as well.
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 CC="clang -arch arm64" \
+            go build -buildvcs=false -buildmode=c-archive -tags libgitlfs -o build/arm64.a ./libgitlfs
+          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 CC="clang -arch x86_64" \
+            go build -buildvcs=false -buildmode=c-archive -tags libgitlfs -o build/amd64.a ./libgitlfs
+          lipo -create build/arm64.a build/amd64.a -output dist/libgitlfs-darwin-universal.a
+
+          cp libgitlfs/libgitlfs.h dist/
+          ls -l dist
+
+      - name: Sign
+        shell: bash
+        run: |
+          set -eu
+          # Ad-hoc signature. A Fab plugin arrives with the quarantine bit set and
+          # an unsigned dlopen target can be refused outright. Replace with a
+          # Developer ID identity once one is available.
+          codesign --force --sign - --timestamp=none dist/libgitlfs-darwin-universal.dylib
+          codesign --verify --verbose dist/libgitlfs-darwin-universal.dylib
+
+      - name: Verify
+        shell: bash
+        run: |
+          set -eu
+          dylib=dist/libgitlfs-darwin-universal.dylib
+
+          # Both slices must be present, or half the Mac userbase silently degrades.
+          archs="$(lipo -archs "$dylib")"
+          echo "architectures: $archs"
+          for a in arm64 x86_64; do
+            echo "$archs" | grep -qw "$a" || { echo "::error::$dylib is missing the $a slice"; exit 1; }
+          done
+
+          for sym in $EXPORTS; do
+            nm -gU "$dylib" | grep -q "_${sym}$" \
+              || { echo "::error::$dylib does not export $sym"; exit 1; }
+          done
+
+          # Dependency closure must be system-only.
+          # Select on indentation rather than skipping a fixed number of lines:
+          # otool -L prints one unindented "<file> (architecture X):" header per
+          # slice, so a universal binary has several, and only the dependency
+          # lines themselves are tab-indented.
+          deps="$(otool -L "$dylib" | grep -E '^[[:space:]]' | awk '{print $1}' | sort -u)"
+          echo "$deps"
+          if echo "$deps" | grep -vqE '^(/usr/lib/|/System/Library/Frameworks/|@rpath/libgitlfs)'; then
+            echo "::error::$dylib links a non-system library that will not exist on a user machine"
+            exit 1
+          fi
+
+          # Deployment target must not exceed what we pinned.
+          vtool -show-build "$dylib" | grep -E 'minos|platform' || true
+          echo "darwin-universal OK"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libgitlfs-darwin-universal
+          path: dist
+
+  linux:
+    name: Build linux-amd64
+    runs-on: ubuntu-latest
+    # Built inside an old image on purpose. Building on ubuntu-latest would emit
+    # GLIBC_2.38+ references, and the .so would then refuse to load on the older
+    # distributions Unreal's Linux toolchain targets — again surfacing only as a
+    # silent fall back to the process path.
+    container: ubuntu:20.04
+    steps:
+      - name: Install build prerequisites
+        run: |
+          set -eu
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates curl build-essential binutils
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p dist
+          CGO_ENABLED=1 go build -buildvcs=false -buildmode=c-shared -tags libgitlfs \
+            -o dist/libgitlfs-linux-amd64.so ./libgitlfs
+          CGO_ENABLED=1 go build -buildvcs=false -buildmode=c-archive -tags libgitlfs \
+            -o dist/libgitlfs-linux-amd64.a ./libgitlfs
+          cp libgitlfs/libgitlfs.h dist/
+          ls -l dist
+
+      - name: Verify
+        shell: bash
+        run: |
+          set -eu
+          so=dist/libgitlfs-linux-amd64.so
+
+          for sym in $EXPORTS; do
+            nm -D --defined-only "$so" | grep -q " ${sym}$" \
+              || { echo "::error::$so does not export $sym"; exit 1; }
+          done
+
+          # Unreal re-opens non-engine modules RTLD_GLOBAL, so these symbols land
+          # in the global namespace. Anything exported beyond our entry points and
+          # the Go runtime's own could shadow an engine symbol.
+          echo "--- exported symbols ---"
+          nm -D --defined-only "$so" | awk '{print $3}' | grep -v '^$' | sort > /tmp/syms.txt
+          unexpected="$(grep -vE '^(GitLFS_|_cgo|crosscall|x_cgo|go\.|runtime\.|type:|_rt0|__libc_csu|_init|_fini|_edata|_end|__bss_start)' /tmp/syms.txt || true)"
+          if [ -n "$unexpected" ]; then
+            echo "::warning::unexpected exported symbols:"; echo "$unexpected"
+          fi
+
+          # Dependency closure must be system-only.
+          echo "--- NEEDED ---"
+          objdump -p "$so" | sed -n 's/^\s*NEEDED\s*//p'
+
+          # glibc floor. Fail loudly rather than shipping a .so that will not load.
+          MAXGLIBC="$(objdump -T "$so" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n1)"
+          echo "maximum required glibc: $MAXGLIBC"
+          highest="$(printf '%s\n' "$MAXGLIBC" "GLIBC_2.31" | sort -V | tail -n1)"
+          if [ "$highest" != "GLIBC_2.31" ]; then
+            echo "::error::$so requires $MAXGLIBC, above the GLIBC_2.31 floor"
+            exit 1
+          fi
+          echo "linux-amd64 OK"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libgitlfs-linux-amd64
+          path: dist
+
+  release:
+    name: Publish release
+    needs: [windows, macos, linux]
+    if: startsWith(github.ref, 'refs/tags/lib-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Collect and checksum
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p release
+          # Raw files, not archives. The Unreal consumer downloads these from a
+          # .Build.cs, and UnrealBuildTool does not reference System.IO.Compression
+          # when compiling rules assemblies — so a zip would need a decompressor
+          # that is not reliably available. A raw file needs none.
+          find artifacts -type f \( -name '*.dll' -o -name '*.dylib' -o -name '*.so' \
+            -o -name '*.a' -o -name '*.lib' \) -exec cp {} release/ \;
+          # One header, shared by every platform.
+          find artifacts -name 'libgitlfs.h' -print -quit | xargs -I{} cp {} release/
+          cd release
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

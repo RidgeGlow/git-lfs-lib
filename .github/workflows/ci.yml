@@ -1,5 +1,17 @@
 name: CI
-on: [push, pull_request]
+# RidgeGlow fork-local. Upstream is `on: [push, pull_request]`; re-apply on sync.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 env:
   GOTOOLCHAIN: local
 
